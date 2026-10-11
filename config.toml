@@ -1,0 +1,91 @@
+# Plant Monitor configuration.
+# Every threshold, default and limit the code needs lives here.
+# Nothing in this file may be hard-coded in Python or SQL.
+
+[generation]
+seed = 42                      # default seed; same seed + inputs = identical output
+machines = 12                  # default machine count
+days = 90                      # default span in days
+start_date = "2026-07-04"      # default first reading date (90 days ending 2026-10-01)
+interval_minutes = 15          # one reading per machine per interval
+lines = 2                      # machines are split across this many production lines
+min_machines = 1
+max_machines = 20
+min_days = 1
+max_days = 180
+
+# Each planted problem can be toggled independently.
+[generation.problems]
+overheat = true                # M-07 temperature climbs over the last 4 days
+slowdown = true                # M-03 speed steps down 12% exactly 7 days before the end
+downtime = true                # M-11 gets 3 downtime events in the last 30 days
+prefailure = true              # 3-5 failures, each preceded by rising vibration
+
+# Per-machine typical values are drawn once from these ranges, then noise is
+# added to each reading. noise_sd is the standard deviation of that noise.
+[generation.normal]
+temperature_c = [70.0, 80.0]
+speed_rpm = [1400.0, 1600.0]
+vibration_mm_s = [2.0, 4.0]
+temperature_noise_sd = 0.8
+speed_noise_sd = 15.0
+vibration_noise_sd = 0.15
+
+# Shape of each planted problem.
+[generation.planted]
+overheat_machine = "M-07"
+overheat_days = 4              # length of the climb
+overheat_rise_c = 25.0         # total rise by the final reading
+slowdown_machine = "M-03"
+slowdown_days = 7              # step occurs this many days before the last reading
+slowdown_percent = 12.0        # size of the step down
+downtime_machine = "M-11"
+downtime_events = 3
+downtime_window_days = 30
+downtime_hours = [2.0, 6.0]    # duration range of each event
+prefailure_min = 3             # number of random failures
+prefailure_max = 5
+prefailure_lead_hours = [6, 12]  # vibration rises for this long beforehand
+prefailure_rise_mm_s = 4.0     # total vibration rise by the failure
+downtime_reasons = ["jam", "maintenance", "power loss", "tooling change"]
+failure_types = ["overheat", "bearing", "power"]  # must match the schema CHECK
+
+# The normal band: a machine's mean +/- sigma standard deviations per reading
+# type, computed over the trailing baseline_days. Used by the abnormal-readings
+# query, the alert rules and the shaded chart region.
+[band]
+sigma = 3
+baseline_days = 14
+# The alert rules judge only the most recent evaluation_days, and measure what
+# "normal" looks like from the baseline_days ENDING where that period starts.
+# Without the gap a multi-day problem inflates its own standard deviation and
+# hides inside its own band: a 4-day temperature climb on M-07 widens the band
+# from 80 C to 102 C and goes undetected.
+evaluation_days = 4
+
+[alerts.sustained_heat]
+consecutive_hours = 6          # hours above the upper band before firing
+severity = "High"
+
+[alerts.speed_drop]
+percent = 10.0                 # 7-day-block drop that fires the rule
+severity = "Medium"
+
+[alerts.repeated_downtime]
+events = 2                     # events within window_days before firing
+window_days = 30
+severity = "Medium"
+
+[alerts.vibration_rising]
+consecutive_hours = 3
+severity = "Medium"
+
+# Loader row validation. A row outside any range is skipped and counted.
+[validation]
+temperature_c = [0.0, 150.0]
+speed_rpm = [0.0, 5000.0]
+vibration_mm_s = [0.0, 50.0]
+
+[kpi]
+uptime_windows = [7, 30]       # selectable uptime windows, in days
+failures_window_days = 7       # "failures in the past 7 days"

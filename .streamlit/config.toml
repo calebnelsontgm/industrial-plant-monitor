@@ -1,0 +1,17 @@
+# Streamlit theme, so the app chrome matches the chart surface.
+#
+# Pinned to light rather than following the OS. The chart colours are chosen
+# and contrast-validated against one surface, and Plotly bakes them into each
+# figure at render time, so a dark chrome would leave the charts stranded on a
+# light plane. One selected mode is honest; an automatic flip is not.
+
+[theme]
+base = "light"
+primaryColor = "#2a78d6"            # categorical slot 1
+backgroundColor = "#fcfcfb"         # chart surface
+secondaryBackgroundColor = "#f3f2ee" # cards, sidebar, table headers
+textColor = "#0b0b0b"               # primary ink
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,13 @@
+# Generated datasets and databases are never committed.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environment
+.venv/
+
+# Assistant instructions: kept locally, not part of the project.
+CLAUDE.md
