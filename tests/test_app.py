@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 from typing import Iterator
@@ -9,10 +10,11 @@ from typing import Iterator
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from plantmonitor import ROOT
+from plantmonitor import ROOT, load_config
 from plantmonitor.alerts import run_alerts
 from plantmonitor.db import connect
 from plantmonitor.load import load_dataset
+from plantmonitor.predict import train_model
 
 APP = str(ROOT / "app.py")
 
@@ -66,8 +68,10 @@ def test_app_starts_without_a_database(app_env: Path) -> None:
 
 
 def test_every_page_runs(loaded_app: Path) -> None:
-    """Each of the five pages renders without raising."""
-    for page in ("Overview", "Machine detail", "Patterns", "Alerts", "Data"):
+    """Each of the six pages renders without raising."""
+    for page in (
+        "Overview", "Machine detail", "Patterns", "Alerts", "Failure risk", "Data"
+    ):
         app = run_app(page)
         assert not app.exception, page
 
@@ -169,3 +173,61 @@ def test_alerts_page_lists_alerts(loaded_app: Path) -> None:
 
     assert not app.exception
     assert app.multiselect, "expected severity and machine filters"
+
+
+def test_failure_risk_page_without_a_model(loaded_app: Path) -> None:
+    """Before any training the page explains how to get a model."""
+    app = run_app("Failure risk")
+
+    assert not app.exception
+    assert any("No failure model" in str(block.value) for block in app.info)
+
+
+def test_failure_risk_page_shows_model(loaded_app: Path) -> None:
+    """With a trained model the page lists risk and the test metrics."""
+    connection = connect(loaded_app)
+    try:
+        train_model(connection, model_dir=loaded_app.parent)
+    finally:
+        connection.close()
+
+    app = run_app("Failure risk")
+
+    assert not app.exception
+    labels = [metric.label for metric in app.metric]
+    assert {"Precision", "Recall", "Failures caught"} <= set(labels)
+    assert len(app.dataframe) >= 1
+
+    # The replay: one animated chart, with one frame per hour of the window.
+    charts = app.get("plotly_chart")
+    assert charts, "expected the replay chart"
+    spec = json.loads(charts[0].proto.spec)
+    settings = load_config()["predict"]
+    assert len(spec["frames"]) >= (
+        settings["replay_hours_before"] + settings["replay_hours_after"]
+    )
+
+
+def test_failure_risk_replays_from_training_database(loaded_app: Path) -> None:
+    """A model trained on its own dataset replays from that dataset's database.
+
+    plant.db holds the 90-day default, which has none of the model's test
+    failures, so the replay only draws if it reads the training database.
+    """
+    import copy
+
+    from plantmonitor.predict import train_on_training_set
+
+    small = copy.deepcopy(load_config())
+    small["predict"]["training"].update(machines=4, days=30, failures=30)
+    result = train_on_training_set(
+        model_dir=loaded_app.parent, data_root=loaded_app.parent / "train", config=small
+    )
+    assert result.trained, result.reason
+
+    app = run_app("Failure risk")
+
+    assert not app.exception
+    captions = " ".join(str(block.value) for block in app.markdown)
+    assert "seed42_4m_30d_30f" in captions
+    assert app.get("plotly_chart"), "expected the replay chart"

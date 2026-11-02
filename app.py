@@ -1,7 +1,7 @@
 """Plant Monitor dashboard.
 
-Five pages, selected from the sidebar: Overview, Machine detail, Patterns,
-Alerts and Data. Everything lives in this one file because the build brief
+Six pages, selected from the sidebar: Overview, Machine detail, Patterns,
+Alerts, Failure risk and Data. Everything lives in this one file because the build brief
 fixes the project layout and has no ``pages/`` directory.
 
 Colour is handled in one place. ``INK``, ``SERIES`` and ``STATUS`` hold the only
@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from plantmonitor import DATA_DIR, DB_PATH, load_config
@@ -38,12 +39,20 @@ from plantmonitor.alerts import resolve_alert, run_alerts
 from plantmonitor.db import connect
 from plantmonitor.generate import PROBLEM_NAMES, SettingsError, generate
 from plantmonitor.load import load_dataset
+from plantmonitor.predict import (
+    current_risk, load_metrics, load_test_risk, loaded_dataset_name,
+    training_db_path,
+)
 
 CONFIG = load_config()
 DATA_ROOT = Path(os.environ.get("PLANTMONITOR_DATA_DIR", str(DATA_DIR)))
 DB = Path(os.environ.get("PLANTMONITOR_DB", str(DB_PATH)))
 
-PAGES = ("Overview", "Machine detail", "Patterns", "Alerts", "Data")
+PAGES = ("Overview", "Machine detail", "Patterns", "Alerts", "Failure risk", "Data")
+
+#: The failure model is saved next to the database, so a test pointing
+#: PLANTMONITOR_DB at a temporary file gets a temporary model too.
+MODEL_DIR = DB.parent
 
 # --- palette ---------------------------------------------------------------
 # Chart chrome and text. Text always wears one of these, never a series colour.
@@ -116,8 +125,10 @@ PROBLEM_GUIDE = {
         "Machine detail",
     ),
     "prefailure": (
-        "3-5 machines",
-        "Vibration climbs for {}-{} hours before each failure.".format(
+        "Random machines",
+        "{}-{} failures, each preceded by vibration climbing for {}-{} "
+        "hours.".format(
+            PLANTED["prefailure_min"], PLANTED["prefailure_max"],
             *PLANTED["prefailure_lead_hours"]
         ),
         "Patterns",
@@ -142,6 +153,11 @@ PAGE_BLURB = {
     "Alerts": (
         "Everything the four rules raised. Each row is one continuous problem, "
         "timestamped at the moment it began."
+    ),
+    "Failure risk": (
+        "A machine-learning model's estimate of how likely each machine is to "
+        "fail within the next {} hours, and how well it did on hours it never "
+        "saw during training.".format(CONFIG["predict"]["horizon_hours"])
     ),
     "Data": (
         "Build a new dataset. The faults are planted deliberately, so the "
@@ -1066,12 +1082,362 @@ def page_alerts() -> None:
         connection.close()
 
 
+def replay_figure(
+    machine_name: str,
+    readings: pd.DataFrame,
+    band: tuple[float, float] | None,
+    scores: pd.DataFrame,
+    failure_ts: pd.Timestamp,
+    window: tuple[pd.Timestamp, pd.Timestamp],
+    threshold: float,
+) -> go.Figure:
+    """Vibration and the model's risk, replayed hour by hour with a slider.
+
+    ``readings`` has ``ts`` and ``vibration_mm_s``. ``scores`` has ``at``, the
+    moment a score became available (the end of the hour it describes), and
+    ``risk``.
+
+    Each slider step is a Plotly animation frame, so dragging runs entirely in
+    the browser instead of rerunning the Streamlit script. At cursor time T a
+    frame shows only what existed at T: readings before T and scores published
+    by T. Readings after T stay as a faint ghost, so the viewer can see what is
+    coming while the model, plainly, cannot.
+    """
+    start, end = window
+
+    # Fixed ranges, so the axes hold still while the frames play.
+    vib_low = readings["vibration_mm_s"].min()
+    vib_high = readings["vibration_mm_s"].max()
+    if band:
+        vib_low, vib_high = min(vib_low, band[0]), max(vib_high, band[1])
+    pad = (vib_high - vib_low) * 0.08
+    vib_range = [vib_low - pad, vib_high + pad]
+    risk_range = [0, 1.05]
+
+    first_warning = scores.loc[scores["risk"] >= threshold, "at"].min()
+    warning_risk = (scores.loc[scores["at"] == first_warning, "risk"].iloc[0]
+                    if pd.notna(first_warning) else None)
+
+    def state(cursor: pd.Timestamp) -> tuple[list[go.Scatter], dict]:
+        """Every animated trace, fully styled, and the title at one cursor time.
+
+        Frames are given the whole trace rather than just its data, because a
+        frame trace that omits ``mode`` or ``line`` loses them when it plays.
+        """
+        seen = readings[readings["ts"] < cursor]
+        published = scores[scores["at"] <= cursor]
+        colours = [STATUS["critical"] if r >= threshold else INK["muted"]
+                   for r in published["risk"]]
+        warned = pd.notna(first_warning) and first_warning <= cursor
+        cursor_line = {"color": INK["primary"], "width": 1.5}
+
+        traces = [
+            go.Scatter(x=seen["ts"], y=seen["vibration_mm_s"], mode="lines",
+                       name="Vibration the model has seen",
+                       line={"color": SERIES["aqua"], "width": 2},
+                       hovertemplate="%{y:.2f} mm/s<extra></extra>"),
+            go.Scatter(x=published["at"], y=published["risk"], mode="lines+markers",
+                       name="Failure risk",
+                       line={"color": INK["secondary"], "width": 2},
+                       marker={"color": colours, "size": 7},
+                       hovertemplate="risk %{y:.0%}<extra></extra>"),
+            go.Scatter(x=[cursor, cursor], y=vib_range, mode="lines",
+                       line=cursor_line, showlegend=False, hoverinfo="skip"),
+            go.Scatter(x=[cursor, cursor], y=risk_range, mode="lines",
+                       line=cursor_line, showlegend=False, hoverinfo="skip"),
+            go.Scatter(x=[first_warning] if warned else [],
+                       y=[warning_risk] if warned else [],
+                       mode="markers+text", name="First warning",
+                       marker={"color": STATUS["critical"], "size": 15,
+                               "symbol": "star"},
+                       text=["first warning"], textposition="top left",
+                       textfont={"color": STATUS["critical"], "size": 11},
+                       hovertemplate="first warning<extra></extra>"),
+        ]
+
+        stamp = cursor.strftime("%b %d %H:%M")
+        if published.empty:
+            text, colour = "{} · no score yet".format(stamp), INK["primary"]
+        else:
+            latest = published["risk"].iloc[-1]
+            alarm = latest >= threshold
+            text = "{} · failure risk {:.0%}{}".format(
+                stamp, latest, " · WARNING" if alarm else "")
+            colour = STATUS["critical"] if alarm else INK["primary"]
+        if cursor >= failure_ts:
+            text += " · {} failed at {}".format(machine_name,
+                                                failure_ts.strftime("%H:%M"))
+        return traces, {"text": text, "font": {"size": 15, "color": colour}}
+
+    figure = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                           row_heights=[0.55, 0.45], vertical_spacing=0.09)
+
+    # Trace 0 is the static ghost; traces 1-5 are the animated ones, and each
+    # frame replaces exactly those, in the same order.
+    figure.add_trace(go.Scatter(
+        x=readings["ts"], y=readings["vibration_mm_s"], mode="lines",
+        name="Vibration still to come", line={"color": INK["grid"], "width": 2},
+        hoverinfo="skip"), row=1, col=1)
+    # The animated traces start empty. Plotly does not redraw the line of a
+    # trace that already had points when the figure was first drawn, so
+    # starting with data leaves the risk line and cursor missing once the
+    # slider moves. Nothing has been seen at the window's start anyway.
+    first_traces, first_title = state(start)
+    for trace, row in zip(first_traces, (1, 2, 1, 2, 2)):
+        figure.add_trace(trace.update(x=[], y=[]), row=row, col=1)
+
+    # Each frame restates the time range, or Plotly autoranges the x axis to
+    # the frame's data and the timeline jumps around as you drag.
+    x_range = {"range": [start, end], "autorange": False}
+    frames = []
+    for cursor in pd.date_range(start, end, freq="h"):
+        traces, title = state(cursor)
+        frames.append(go.Frame(
+            name=cursor.strftime("%b %d %H:%M"), data=traces,
+            traces=list(range(1, 6)),
+            layout={"title": title, "xaxis": x_range, "xaxis2": x_range},
+        ))
+    figure.frames = frames
+
+    # Shapes go on after the traces: Plotly skips adding a line or band to a
+    # subplot that has no data in it yet.
+    if band:
+        figure.add_hrect(y0=band[0], y1=band[1], row=1, col=1,
+                         fillcolor="rgba(42,120,214,0.09)", line_width=0,
+                         annotation_text="normal band", annotation_position="top left",
+                         annotation_font={"size": 10, "color": INK["muted"]},
+                         layer="below")
+    figure.add_hline(y=threshold, row=2, col=1, line_width=1, line_dash="dash",
+                     line_color=STATUS["critical"],
+                     annotation_text="warning at {:.0%}".format(threshold),
+                     annotation_position="bottom left",
+                     annotation_font={"size": 10, "color": STATUS["critical"]})
+    for row in (1, 2):
+        figure.add_vline(x=failure_ts, row=row, col=1, line_width=2,
+                         line_dash="dot", line_color=STATUS["critical"])
+    figure.add_annotation(x=failure_ts, y=1, yref="y domain", text="failure",
+                          showarrow=False, xanchor="left", yanchor="top", xshift=4,
+                          font={"size": 11, "color": STATUS["critical"]})
+
+    style_figure(figure, first_title["text"], height=560)
+    figure.update_layout(
+        hovermode="closest",
+        margin={"l": 8, "r": 8, "t": 70, "b": 8},
+        sliders=[{
+            "active": 0,
+            "currentvalue": {"prefix": "Replay time: ", "font": {"size": 12}},
+            "pad": {"t": 36},
+            "steps": [
+                {"label": frame.name, "method": "animate",
+                 "args": [[frame.name], {"mode": "immediate",
+                                         "frame": {"duration": 0, "redraw": True},
+                                         "transition": {"duration": 0}}]}
+                for frame in frames
+            ],
+        }],
+        updatemenus=[{
+            "type": "buttons", "direction": "left", "showactive": False,
+            "x": 0, "y": -0.02, "xanchor": "right", "yanchor": "top",
+            "pad": {"t": 36, "r": 10},
+            "buttons": [
+                {"label": "▶ Play", "method": "animate",
+                 "args": [None, {"frame": {"duration": 350, "redraw": True},
+                                 "transition": {"duration": 0},
+                                 "fromcurrent": True}]},
+                {"label": "❚❚", "method": "animate",
+                 "args": [[None], {"frame": {"duration": 0, "redraw": False},
+                                   "mode": "immediate"}]},
+            ],
+        }],
+    )
+    figure.update_xaxes(range=[start, end], autorange=False)
+    figure.update_yaxes(range=vib_range, row=1, col=1,
+                        title={"text": "vibration mm/s",
+                               "font": {"size": 11, "color": INK["muted"]}})
+    figure.update_yaxes(range=risk_range, row=2, col=1, tickformat=".0%",
+                        title={"text": "failure risk",
+                               "font": {"size": 11, "color": INK["muted"]}})
+    return figure
+
+
+def replay_section(metrics: dict, connection) -> None:
+    """Pick a test-period failure and replay what the model saw before it."""
+    settings = CONFIG["predict"]
+    scores = load_test_risk(MODEL_DIR)
+    if scores is None or not metrics["failures"]:
+        return
+
+    section(
+        "Replay a failure",
+        "Drag the slider, or press Play, to step through the hours before a "
+        "failure. At each moment you see only what the model had seen: "
+        "vibration up to that time (the grey line is still to come) and the "
+        "risk it reported. When risk crosses {:.0%} it is a warning. Every "
+        "failure here is from the test period, which the model never trained "
+        "on.".format(settings["risk_threshold"]),
+    )
+
+    failures = metrics["failures"]
+    labels = [
+        "{} · failed {} · {}".format(
+            f["machine_name"], f["ts"].replace("T", " ")[:16],
+            "warned {:.1f} h early".format(f["hours_early"]) if f["caught"]
+            else "missed",
+        )
+        for f in failures
+    ]
+    choice = st.selectbox("Failure", range(len(failures)),
+                          format_func=lambda i: labels[i])
+    failure = failures[choice]
+
+    failure_ts = pd.Timestamp(failure["ts"])
+    start = (failure_ts - pd.Timedelta(hours=settings["replay_hours_before"])).floor("h")
+    end = (failure_ts + pd.Timedelta(hours=settings["replay_hours_after"])).ceil("h")
+
+    machine_scores = scores[scores["machine_name"] == failure["machine_name"]]
+    machine_id = int(machine_scores["machine_id"].iloc[0])
+    # A score for hour H uses readings up to the end of H, so it only exists
+    # from H + 1h. Plotting it there keeps the replay honest about timing.
+    machine_scores = machine_scores.assign(
+        at=machine_scores["hour"] + pd.Timedelta(hours=1)
+    )
+    machine_scores = machine_scores[
+        (machine_scores["at"] >= start) & (machine_scores["at"] <= end)
+    ]
+
+    readings = queries.machine_readings(
+        machine_id, start.strftime("%Y-%m-%dT%H:%M:%S"),
+        end.strftime("%Y-%m-%dT%H:%M:%S"), connection,
+    )
+    readings["ts"] = pd.to_datetime(readings["ts"])
+    readings = readings[(readings["ts"] >= start) & (readings["ts"] <= end)]
+
+    # Normal band measured from the 14 days ending where the replay starts,
+    # so the run-up to the failure cannot widen the band it is compared to.
+    band = band_for(machine_id, start.strftime("%Y-%m-%dT%H:%M:%S"),
+                    connection).get("vibration_mm_s")
+
+    st.plotly_chart(
+        replay_figure(failure["machine_name"], readings, band, machine_scores,
+                      failure_ts, (start, end), settings["risk_threshold"]),
+        width="stretch", config={"displayModeBar": False},
+    )
+
+
+def performance_section(metrics: dict) -> None:
+    """The test metrics, with the caveat that makes recall readable."""
+    section(
+        "Model performance",
+        "Dataset {}: trained on hours before {}, tested on the {:,} hours "
+        "after it. The model never saw the test hours, so these numbers are "
+        "what it would have scored on new data.".format(
+            metrics["dataset"], metrics["test_start"][:10], metrics["test_hours"]
+        ),
+    )
+    cols = st.columns(4)
+    cols[0].metric("Precision", "{:.0%}".format(metrics["precision"]),
+                   help="Of the hours it flagged, the share that really were "
+                        "within {} hours of a failure.".format(
+                            metrics["horizon_hours"]))
+    cols[1].metric("Recall", "{:.0%}".format(metrics["recall"]),
+                   help="Of the hours within {} hours of a failure, the share "
+                        "it flagged.".format(metrics["horizon_hours"]))
+    cols[2].metric("Failures caught", "{} of {}".format(
+        metrics["caught"], metrics["test_failures"]),
+        help="Test-period failures with at least one flagged hour beforehand.")
+    early = metrics["mean_hours_early"]
+    cols[3].metric("Average warning",
+                   "{:.1f} h".format(early) if early is not None else "-",
+                   help="From the first flagged hour to the failure.")
+
+    st.caption(
+        "Recall is low by design, not by accident: every hour in the {} before "
+        "a failure counts as a failure hour, but the warning sign (rising "
+        "vibration) only starts {}-{} hours out. The earlier hours look normal, "
+        "so no model can flag them. Failures caught is the number to judge it "
+        "by.".format(metrics["horizon_hours"], *PLANTED["prefailure_lead_hours"])
+    )
+
+
+def current_risk_section(risk: pd.DataFrame) -> None:
+    """Each machine's risk at the dataset's final hour."""
+    settings = CONFIG["predict"]
+    section(
+        "Current risk",
+        "Probability of a failure within {} hours, from each machine's last "
+        "full hour ({}). Machines at or above {:.0%} are flagged.".format(
+            settings["horizon_hours"], risk["hour"].max().strftime("%Y-%m-%d %H:00"),
+            settings["risk_threshold"],
+        ),
+    )
+    shown = risk.assign(
+        risk_pct=risk["risk"] * 100,
+        status=risk["flagged"].map({True: "High risk", False: ""}),
+    )
+    st.dataframe(
+        shown[["machine_name", "risk_pct", "status"]],
+        hide_index=True, width="stretch",
+        column_config={
+            "machine_name": st.column_config.TextColumn("Machine"),
+            "risk_pct": st.column_config.ProgressColumn(
+                "Failure risk", min_value=0, max_value=100, format="%.0f%%"
+            ),
+            "status": st.column_config.TextColumn("Flag"),
+        },
+    )
+
+
+def model_database(metrics: dict) -> Path | None:
+    """The database holding the dataset the model was trained and tested on.
+
+    Usually the model's own training database, but a model trained directly on
+    the loaded dataset is replayed from that instead.
+    """
+    for path in (training_db_path(MODEL_DIR, CONFIG), DB):
+        if loaded_dataset_name(path) == metrics["dataset"]:
+            return path
+    return None
+
+
+def page_failure_risk() -> None:
+    training = CONFIG["predict"]["training"]
+    metrics = load_metrics(MODEL_DIR)
+    connection = connect(DB)
+    try:
+        risk = current_risk(connection, model_dir=MODEL_DIR, config=CONFIG)
+    finally:
+        connection.close()
+    if risk is None or metrics is None:
+        st.info(
+            "No failure model trained yet. Run `python -m plantmonitor train` "
+            "to train one on its own {}-day, {}-failure dataset.".format(
+                training["days"], training["failures"]
+            )
+        )
+        return
+
+    # The replay leads: it is the one view that shows a warning arriving
+    # before a failure, rather than summarising that it did. Its readings come
+    # from the model's own dataset, which is not necessarily the loaded one.
+    replay_db = model_database(metrics)
+    if replay_db is not None:
+        replay_connection = connect(replay_db)
+        try:
+            replay_section(metrics, replay_connection)
+        finally:
+            replay_connection.close()
+
+    performance_section(metrics)
+    current_risk_section(risk)
+
+
 def page_data() -> None:
     generation = CONFIG["generation"]
 
     st.markdown(
         '<div class="pm-meta">Generating writes CSVs to <code>data/</code>, '
-        "rebuilds the database from them, and runs the four alert rules. "
+        "rebuilds the database from them and runs the four alert rules. The "
+        "failure model has its own training dataset and is not retrained. "
         "The same seed and inputs always produce the same dataset.</div>",
         unsafe_allow_html=True,
     )
@@ -1126,7 +1492,7 @@ def page_data() -> None:
         result.settings.name, data_root=DATA_ROOT, db_path=DB, config=CONFIG,
     )
 
-    progress.progress(0.8, text="Running the alert rules...")
+    progress.progress(0.6, text="Running the alert rules...")
     connection = connect(DB)
     try:
         alert_result = run_alerts(connection, config=CONFIG)
@@ -1193,6 +1559,8 @@ def main() -> None:
         page_patterns()
     elif page == "Alerts":
         page_alerts()
+    elif page == "Failure risk":
+        page_failure_risk()
 
 
 main()

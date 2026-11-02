@@ -153,3 +153,34 @@ def test_manifest_records_every_input(tmp_path: Path) -> None:
         "prefailure",
     }
     assert manifest["name"] == "seed5_3m_8d"
+
+
+def test_failure_count_option(tmp_path: Path) -> None:
+    """An explicit failure count plants exactly that many and names the dataset after it."""
+    import json
+
+    result = generate(data_root=tmp_path, seed=5, machines=4, days=20, failures=9)
+
+    assert len(pd.read_csv(result.directory / "failures.csv")) == 9
+    assert result.settings.name == "seed5_4m_20d_9f"
+    manifest = json.loads((result.directory / "dataset.json").read_text())
+    assert manifest["failures"] == 9
+
+
+def test_default_failure_count_is_random_in_range(default_dataset, config) -> None:
+    """Without a count, the default dataset keeps its random 12-16 failures."""
+    planted = config["generation"]["planted"]
+    failures = pd.read_csv(default_dataset.directory / "failures.csv")
+
+    assert default_dataset.settings.failures is None
+    assert default_dataset.settings.name == "seed42_12m_90d"
+    assert planted["prefailure_min"] <= len(failures) <= planted["prefailure_max"]
+
+
+@pytest.mark.parametrize("failures", [-1, 201])
+def test_failure_count_out_of_range_rejected(tmp_path: Path, failures: int) -> None:
+    """A failure count outside the config limits raises before anything is written."""
+    with pytest.raises(SettingsError, match="failures"):
+        generate(data_root=tmp_path, failures=failures)
+
+    assert not list(tmp_path.iterdir())

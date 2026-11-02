@@ -112,6 +112,20 @@ def machine_readings(
     return query("machine_readings.sql", (machine_id, start_ts, end_ts), connection)
 
 
+def prediction_readings(
+    start_ts: str, end_ts: str, connection: sqlite3.Connection | None = None
+) -> pd.DataFrame:
+    """Every machine's raw readings over a date range, for the failure model."""
+    return query("prediction_readings.sql", (start_ts, end_ts), connection)
+
+
+def prediction_failures(
+    start_ts: str, end_ts: str, connection: sqlite3.Connection | None = None
+) -> pd.DataFrame:
+    """Every failure over a date range with its timestamp, for labelling."""
+    return query("prediction_failures.sql", (start_ts, end_ts), connection)
+
+
 def standard_deviation(variance: float) -> float:
     """Square root of a variance.
 
@@ -134,6 +148,8 @@ __all__ = [
     "machine_readings",
     "machine_timeline",
     "plant_status",
+    "prediction_failures",
+    "prediction_readings",
     "speed_week_over_week",
     "standard_deviation",
 ]

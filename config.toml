@@ -13,13 +13,15 @@ min_machines = 1
 max_machines = 20
 min_days = 1
 max_days = 180
+min_failures = 0               # limits for an explicit pre-failure event count
+max_failures = 200
 
 # Each planted problem can be toggled independently.
 [generation.problems]
 overheat = true                # M-07 temperature climbs over the last 4 days
 slowdown = true                # M-03 speed steps down 12% exactly 7 days before the end
 downtime = true                # M-11 gets 3 downtime events in the last 30 days
-prefailure = true              # 3-5 failures, each preceded by rising vibration
+prefailure = true              # 12-16 failures, each preceded by rising vibration
 
 # Per-machine typical values are drawn once from these ranges, then noise is
 # added to each reading. noise_sd is the standard deviation of that noise.
@@ -43,8 +45,11 @@ downtime_machine = "M-11"
 downtime_events = 3
 downtime_window_days = 30
 downtime_hours = [2.0, 6.0]    # duration range of each event
-prefailure_min = 3             # number of random failures
-prefailure_max = 5
+# 12-16 failures so the failure model has examples on both sides of its
+# train/test split. With 3-5 they all tend to land in the training period and
+# the model would be tested on no failures at all.
+prefailure_min = 12            # number of random failures
+prefailure_max = 16
 prefailure_lead_hours = [6, 12]  # vibration rises for this long beforehand
 prefailure_rise_mm_s = 4.0     # total vibration rise by the failure
 downtime_reasons = ["jam", "maintenance", "power loss", "tooling change"]
@@ -89,3 +94,35 @@ vibration_mm_s = [0.0, 50.0]
 [kpi]
 uptime_windows = [7, 30]       # selectable uptime windows, in days
 failures_window_days = 7       # "failures in the past 7 days"
+
+# Failure prediction (plantmonitor/predict.py).
+[predict]
+feature_windows_hours = [6, 12]  # trailing windows for mean, max and slope
+# Features are measured in standard deviations from each machine's own
+# baseline ([band] baseline_days of readings), so they cannot identify the
+# machine. The baseline ends this many hours before the hour being scored, so
+# a developing problem cannot inflate its own baseline.
+baseline_lag_hours = 24
+horizon_hours = 24             # label = "a failure within the next 24 hours"
+test_fraction = 0.3            # the latest 30% of hours are held out for testing
+# Training hours whose 24-hour label window reaches into the test period are
+# dropped (a gap of horizon_hours), otherwise their labels leak test failures.
+n_estimators = 200             # trees in the random forest
+min_samples_leaf = 3           # stops trees memorising single noisy hours
+random_state = 42              # same data + same seed = same model
+risk_threshold = 0.5           # probability at or above which an hour is "flagged"
+replay_hours_before = 36       # Failure risk replay: hours shown before the failure
+replay_hours_after = 6         # ...and after it
+
+# The model trains and is tested on its own dataset, not the one loaded in
+# plant.db. The default 90 days holds only 3 test-period failures, too few to
+# measure anything; 180 days with 70 failures puts about 20 in the test period.
+# It is generated into data/<name>/ and loaded into its own database, so the
+# 90-day default stays the dashboard's active dataset.
+[predict.training]
+seed = 42                      # same seed as the default: the same 12 machines
+machines = 12
+days = 180
+start_date = "2026-04-05"      # ends 2026-10-01, the same day as the default
+failures = 70                  # exact pre-failure event count
+database = "training.db"       # saved next to plant.db

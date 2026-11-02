@@ -1,7 +1,7 @@
 """Command line: ``python -m plantmonitor <command>``.
 
-Commands: ``generate``, ``load``, ``alerts``, ``dashboard``, and ``sql`` for
-the scratchpad.
+Commands: ``generate``, ``load``, ``alerts``, ``train``, ``dashboard``, and
+``sql`` for the scratchpad.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from .db import connect
 from .alerts import run_alerts
 from .generate import PROBLEM_NAMES, SettingsError, generate
 from .load import load_dataset
+from .predict import load_metrics, train_on_training_set
 
 #: Scratchpad file, kept out of sql/ so the seven project queries stay a clean
 #: set. Not part of the app: it exists to try SQL against the database.
@@ -30,7 +31,9 @@ SCRATCH_ROW_LIMIT = 50
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    generation = load_config()["generation"]
+    config = load_config()
+    generation = config["generation"]
+    training = config["predict"]["training"]
 
     parser = argparse.ArgumentParser(
         prog="python -m plantmonitor",
@@ -51,6 +54,14 @@ def _build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--machines", type=int, help="number of machines")
     gen.add_argument("--days", type=int, help="days of readings")
     gen.add_argument("--start", dest="start_date", help="first reading date, YYYY-MM-DD")
+    gen.add_argument(
+        "--failures",
+        type=int,
+        help="exact number of pre-failure events (default: random, {}-{})".format(
+            generation["planted"]["prefailure_min"],
+            generation["planted"]["prefailure_max"],
+        ),
+    )
     for problem in PROBLEM_NAMES:
         gen.add_argument(
             "--no-{}".format(problem),
@@ -62,7 +73,10 @@ def _build_parser() -> argparse.ArgumentParser:
     loader = commands.add_parser(
         "load",
         help="Build data/plant.db from a dataset's CSVs",
-        description="Replaces data/plant.db with a fresh database holding this dataset.",
+        description=(
+            "Replaces data/plant.db with a fresh database holding this dataset. "
+            "The failure model is not retrained: it has its own dataset (see train)."
+        ),
     )
     loader.add_argument("dataset", help="dataset folder name under data/")
 
@@ -76,6 +90,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     alerts.add_argument(
         "--as-of", dest="as_of", help="judge as at this timestamp (default: latest reading)"
+    )
+
+    commands.add_parser(
+        "train",
+        help="Train the failure model on its own training dataset",
+        description=(
+            "Generates the [predict.training] dataset if needed ({machines} "
+            "machines, {days} days, {failures} failures), loads it into "
+            "data/{database}, trains on the earlier hours, tests on the later "
+            "ones, and saves the model to data/. Prints the test metrics. "
+            "data/plant.db is not touched."
+        ).format(**training),
     )
 
     commands.add_parser(
@@ -115,6 +141,7 @@ def _run_generate(args: argparse.Namespace) -> int:
             days=args.days,
             start_date=args.start_date,
             problems=problems or None,
+            failures=args.failures,
         )
     except SettingsError as exc:
         print("error: {}".format(exc), file=sys.stderr)
@@ -136,6 +163,9 @@ def _run_load(args: argparse.Namespace) -> int:
         return 2
 
     print(result.summary())
+    # The model trains on its own dataset, so loading leaves it as it is.
+    if load_metrics() is None:
+        print("No failure model yet. Run 'train' to build one.")
     return 0
 
 
@@ -155,6 +185,12 @@ def _run_alerts(args: argparse.Namespace) -> int:
 
     print(result.summary())
     return 0
+
+
+def _run_train(_args: argparse.Namespace) -> int:
+    result = train_on_training_set()
+    print(result.summary())
+    return 0 if result.trained else 1
 
 
 def _skip_streamlit_email_prompt() -> None:
@@ -258,6 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "generate": _run_generate,
         "load": _run_load,
         "alerts": _run_alerts,
+        "train": _run_train,
         "dashboard": _run_dashboard,
         "sql": _run_sql,
     }

@@ -5,8 +5,9 @@ lines each report temperature, speed and vibration every fifteen minutes. The
 app computes uptime and downtime per machine, builds a statistical control band
 for each machine from its own recent history, flags the readings that fall
 outside it, and raises alerts for sustained overheating, rising vibration ahead
-of a failure, and week-over-week speed loss. Everything is presented in a
-dashboard.
+of a failure, and week-over-week speed loss. A machine-learning model estimates
+each machine's chance of failing in the next 24 hours. Everything is presented
+in a dashboard.
 
 **The data is simulated.** There is no real plant behind this. A generator
 fabricates ninety days of readings — about 104,000 of them — in the shape a
@@ -39,6 +40,9 @@ sql/*.sql            the analysis: thirteen query files
       |
 alerts.py            four rules, written to the alerts table
       |
+predict.py           failure model, trained on its own dataset in
+      |              data/training.db, saved to data/model.joblib
+      |
 app.py               the dashboard
 ```
 
@@ -63,6 +67,7 @@ On macOS or Linux the interpreter is at `.venv/bin/python` instead.
 .venv/Scripts/python -m plantmonitor generate     # write CSVs to data/<name>/
 .venv/Scripts/python -m plantmonitor load <name>  # build data/plant.db
 .venv/Scripts/python -m plantmonitor alerts       # apply the four alert rules
+.venv/Scripts/python -m plantmonitor train        # build the failure model (its own dataset)
 .venv/Scripts/python -m plantmonitor dashboard    # open the dashboard
 ```
 
@@ -70,11 +75,12 @@ On macOS or Linux the interpreter is at `.venv/bin/python` instead.
 the defaults that is `seed42_12m_90d`.
 
 Or skip all of it and use the dashboard's **Data** page, which does the same
-three steps behind a progress bar.
+same steps behind a progress bar.
 
 Every input to `generate` has a flag — `--seed`, `--machines`, `--days`,
-`--start`, `--name`, and `--no-overheat` and friends to switch off a planted
-problem. Anything not given falls back to `config.toml`. The same seed and
+`--start`, `--name`, `--failures` for an exact number of pre-failure events
+instead of the random 12-16, and `--no-overheat` and friends to switch off a
+planted problem. Anything not given falls back to `config.toml`. The same seed and
 inputs always produce byte-identical CSVs.
 
 ### Writing your own queries
@@ -135,7 +141,7 @@ on `generate`:
 | Overheating | M-07 | Temperature climbs steadily over the final 4 days |
 | Slowdown | M-03 | Speed drops 12% exactly 7 days before the end |
 | Repeated downtime | M-11 | Three downtime events in the final 30 days |
-| Rising vibration | 3-5 random machines | Vibration climbs for 6-12 hours before each failure |
+| Rising vibration | Random machines | 12-16 failures, each after 6-12 hours of climbing vibration |
 
 Ask for fewer machines than a named one needs and that problem is skipped and
 reported, rather than failing.
@@ -172,6 +178,8 @@ file, named after it, and binds the parameters positionally.
 | `machine_readings.sql` | One machine's readings over a date range |
 | `machine_timeline.sql` | One machine's downtime events and failures, as one list |
 | `plant_status.sql` | Every machine's line, running state and last reading |
+| `prediction_readings.sql` | Every machine's raw readings, for the failure model |
+| `prediction_failures.sql` | Every failure's timestamp, for labelling the model's hours |
 
 A few conventions run through all of them.
 
@@ -239,7 +247,7 @@ constraint and `INSERT OR IGNORE` then do the rest.
 
 ## The dashboard
 
-Five pages, chosen from the sidebar. Every page shows the loaded dataset's
+Six pages, chosen from the sidebar. Every page shows the loaded dataset's
 settings at the top, read from `dataset_meta`.
 
 - **Overview** - a diagram of the plant with every machine coloured by its
@@ -254,6 +262,10 @@ settings at the top, read from `dataset_meta`.
   threshold the alert rule fires at, and failures by type
 - **Alerts** - every alert, filterable by severity and machine, with a
   mark-resolved button
+- **Failure risk** - a replay of the hours before each test-period failure:
+  drag a slider through time and watch the model's risk climb, and cross the
+  warning line, before the failure happens. Then the test metrics, and each
+  machine's risk at the final hour
 - **Data** - generate a new dataset and load it
 
 Overview opens with a panel naming the faults planted in the loaded dataset
@@ -277,12 +289,107 @@ the app chrome and the chart surface agree.
 
 <!-- Screenshots go here. -->
 
+## Failure prediction
+
+The alert rules say what is wrong *now*. The failure model tries to say what
+will go wrong *next*: for every machine, every hour, how likely is it to fail
+within the next 24 hours?
+
+**What it looks at.** Every hour, for each machine, it summarises the last 6
+hours and the last 12 hours of temperature, speed and vibration: the average,
+the peak, and the trend (the slope of a straight line fitted through the hourly
+averages, i.e. how fast the reading is climbing or falling). That is 18 numbers
+per machine per hour. The trend matters most, because a machine heading for
+failure is one whose vibration is *rising*, whatever its usual level.
+
+Every one of those numbers is measured against **that machine's own normal**,
+in standard deviations: how far this window's average and peak sit from the
+machine's baseline mean (3.0 is the top of its normal band), and how many
+standard deviations an hour it is climbing. The baseline is the same one the
+alert rules use, the machine's mean and spread over 14 days of readings, and it
+ends 24 hours before the hour being scored, so a problem that is building up
+cannot drag its own baseline up with it and hide. Each machine's first 15 days
+have no full baseline yet, so they are left out.
+
+**What it learns from.** Each hour is labelled "yes" if that machine actually
+failed within the following 24 hours, otherwise "no". The model is a random
+forest: a few hundred decision trees, each trained on a random sample of the
+hours, that vote. Failure hours are about 1% of the data, so the "yes" hours
+are given extra weight. Without that, the model scores best by always saying
+"no".
+
+**How it is tested honestly.** The hours are split by time, not at random: the
+earlier 70% train the model and the latest 30% test it. A random split would
+cheat, because 14:00 and 15:00 share most of their 12-hour window, so the model
+would be tested on hours it had nearly seen. The training hours also stop a day
+short of the test period. A training hour's label looks 24 hours ahead, so the
+last day before the split would otherwise carry answers about test-period
+failures. The final day of data is not used for scoring either, since a failure
+just after the data ends would be invisible.
+
+**Its own dataset.** The default 90-day dataset leaves only 3 failures in the
+test period, too few to measure anything. So the model trains and is tested on
+a separate dataset, set in `[predict.training]` in `config.toml`: the same 12
+machines and seed, 180 days, and exactly 70 planted failures. `train` generates
+it into `data/seed42_12m_180d_70f/` and loads it into its own database,
+`data/training.db`, leaving the dashboard's `data/plant.db` alone. Loading or
+generating a dataset does not retrain the model; only `train` does. The
+dashboard scores the loaded dataset with it, and replays failures from the
+training database, which is where the test failures are.
+
+**How to read its scores.** On the time-based test split (the last 30% of
+the usable hours, 14,172 machine-hours over about 49 days) the model was
+trained on 42 failures and tested on 20:
+
+| Measure | Result |
+| --- | --- |
+| Failures flagged in advance | 20 of 20 |
+| Average warning | 7.4 hours before the failure (4.0 to 10.2) |
+| Precision | 0.91: 162 of the 178 flagged hours were within 24 hours of a failure |
+| Recall | 0.36: of the 454 hours within 24 hours of a failure, it flagged 162 |
+| False alarms | 16 flagged hours with no failure on that machine within 24 hours |
+
+Recall is low and that is expected. Every hour in the 24 before a failure
+counts as a "failure" hour, but the warning sign only starts 6-12 hours out, so
+the earlier hours look completely normal and no model could flag them.
+"Failures caught, and how early" is the number that matters.
+
+Half of the false alarms need a footnote: 8 of the 16 are the hour a machine
+actually failed in, or the hour after. A label only looks at failures *after*
+its hour ends, so those hours score as false alarms even though the machine
+really was failing.
+
+**Why the features are relative.** The first version fed the model raw
+averages. Each machine has its own typical speed and temperature, so those
+also told the model *which machine* it was looking at, and machines that had
+failed often in training looked risky all the time. To measure that, a
+classifier was trained to guess the machine from the features alone. On raw
+features it was right 99.9% of the time; on the relative features, 8.2%,
+which is chance for 12 machines. Retrained on the same data with the same
+split, the change cut false alarms from 60 to 16 (M-10 alone had 29 of the
+60), raised precision from 0.75 to 0.91, and still caught every test failure.
+The test set is slightly different (20 failures rather than 22) because the
+15-day warm-up moves the split point about four days later.
+
+The model, its test metrics and its score for every test hour are saved to
+`data/model.joblib`, `data/model_metrics.json` and `data/model_test_risk.csv`.
+
+**Seeing it work.** The dashboard's replay plays back those saved test-hour
+scores. At each slider position it shows only what existed at that moment:
+vibration up to then (the rest is a faint grey line still to come) and the
+risk the model had reported so far. A score for an hour is plotted at the end
+of that hour, because that is when its last reading arrives. Only test-period
+failures can be replayed: the model saw the training hours' answers, so
+replaying those would make it look better than it is. All of
+its settings are in the `[predict]` section of `config.toml`.
+
 ## Settings
 
 Every threshold, default and limit is in [`config.toml`](config.toml): the
 generator's defaults and limits, the shape of each planted problem, the band
 width, the four alert rules, the loader's validation ranges, and the dashboard's
-uptime windows. Nothing is hard-coded in Python or SQL.
+uptime windows, and the failure model's windows, split and threshold. Nothing is
+hard-coded in Python or SQL.
 
 ## Tests
 
@@ -293,9 +400,14 @@ uptime windows. Nothing is hard-coded in Python or SQL.
 Run it as `python -m pytest`, not bare `pytest`, so the project root lands on
 `sys.path` and `import plantmonitor` resolves.
 
-Sixty-six tests, covering the schema, the generator's reproducibility and
-planted problems, the loader's row validation, every query against a
-purpose-built fixture, all four alert rules, and the dashboard through
+Eighty-three tests, covering the schema, the generator's reproducibility, planted
+problems and failure-count option, the loader's row validation, every query against a
+purpose-built fixture, all four alert rules, the failure model (no overlap
+between training and test hours, most test failures caught, one risk between
+0 and 1 per machine, a saved score for every test hour, training on its own
+dataset without touching `plant.db`, features that are identical for two
+machines differing only in level and spread, and that never look ahead), and
+the dashboard through
 `streamlit.testing.v1.AppTest`. Two are timing checks: the full dataset must
 load in under ten seconds and every dashboard query must return in under one.
 
@@ -332,7 +444,8 @@ fired once is never contaminated by another planted condition.
 │   ├── generate.py      dataset generation
 │   ├── load.py          CSV validation and loading
 │   ├── queries.py       one function per .sql file
-│   └── alerts.py        the four alert rules
+│   ├── alerts.py        the four alert rules
+│   └── predict.py       the failure model
 ├── data/                datasets and plant.db (git-ignored)
 └── tests/
 ```

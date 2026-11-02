@@ -57,6 +57,9 @@ class Settings:
     interval_minutes: int
     lines: int
     problems: dict[str, bool]
+    #: Exact number of pre-failure events, or None for a random count in the
+    #: config's prefailure_min..prefailure_max range.
+    failures: int | None = None
 
     @property
     def readings_per_machine(self) -> int:
@@ -85,12 +88,13 @@ def resolve_settings(
     days: int | None = None,
     start_date: str | None = None,
     problems: dict[str, bool] | None = None,
+    failures: int | None = None,
     config: dict[str, Any] | None = None,
 ) -> Settings:
     """Apply config defaults, then validate against the config limits.
 
-    Raises :class:`SettingsError` if the machine count or day count is out of
-    range, or the start date is not an ISO date.
+    Raises :class:`SettingsError` if the machine count, day count or failure
+    count is out of range, or the start date is not an ISO date.
     """
     config = config or load_config()
     generation = config["generation"]
@@ -110,6 +114,14 @@ def resolve_settings(
     if not low <= days <= high:
         raise SettingsError(f"days must be between {low} and {high}, got {days}")
 
+    if failures is not None:
+        failures = int(failures)
+        low, high = generation["min_failures"], generation["max_failures"]
+        if not low <= failures <= high:
+            raise SettingsError(
+                f"failures must be between {low} and {high}, got {failures}"
+            )
+
     try:
         datetime.strptime(start_date, "%Y-%m-%d")
     except ValueError as exc:
@@ -123,8 +135,13 @@ def resolve_settings(
             raise SettingsError(f"unknown problem {key!r}")
         resolved_problems[key] = bool(value)
 
+    # A fixed failure count changes the data, so it goes in the default name.
+    default_name = f"seed{seed}_{machines}m_{days}d"
+    if failures is not None:
+        default_name += f"_{failures}f"
+
     return Settings(
-        name=name or f"seed{seed}_{machines}m_{days}d",
+        name=name or default_name,
         seed=seed,
         machines=machines,
         days=days,
@@ -132,6 +149,7 @@ def resolve_settings(
         interval_minutes=generation["interval_minutes"],
         lines=generation["lines"],
         problems=resolved_problems,
+        failures=failures,
     )
 
 
@@ -323,7 +341,12 @@ def _build_failures(
     per_hour = _readings_per_hour(settings)
     lead_low, lead_high = planted["prefailure_lead_hours"]
     machine_ids = sorted(rows)
+    # The random count is always drawn, even when it is then overridden, so
+    # the draws that follow line up with those of the same settings without a
+    # count: an explicit count extends or trims that sequence of failures.
     count = rng.randint(planted["prefailure_min"], planted["prefailure_max"])
+    if settings.failures is not None:
+        count = settings.failures
     rise = planted["prefailure_rise_mm_s"]
 
     failures: list[tuple[int, str, str]] = []
@@ -366,6 +389,7 @@ def generate(
     days: int | None = None,
     start_date: str | None = None,
     problems: dict[str, bool] | None = None,
+    failures: int | None = None,
     data_root: Path | None = None,
     config: dict[str, Any] | None = None,
 ) -> Result:
@@ -383,6 +407,7 @@ def generate(
         days=days,
         start_date=start_date,
         problems=problems,
+        failures=failures,
         config=config,
     )
 
@@ -454,6 +479,7 @@ def generate(
         "days": settings.days,
         "start_date": settings.start_date,
         "problems": settings.problems,
+        "failures": settings.failures,
         "generated_at": datetime.now(timezone.utc).strftime(TS_FORMAT),
         "skipped": result.skipped,
     }
